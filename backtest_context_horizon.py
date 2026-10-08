@@ -292,6 +292,13 @@ def plot_fan_chart(results, df, context, path):
     plt.close(fig)
 
 
+def save_excel(path, tables, all_results):
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, table in tables.items():
+            table.to_excel(writer, sheet_name=name)
+        all_results.drop(columns="item_id").to_excel(writer, sheet_name="forecasts", index=False)
+
+
 ################## Main #####################################
 
 def main(pipeline=None):
@@ -323,10 +330,14 @@ def main(pipeline=None):
         print(tables["MAFE_common"].round(0).to_string())
 
     output_file = os.path.join(OUTPUT_DIR, "backtest_context_horizon.xlsx")
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        for name, table in tables.items():
-            table.to_excel(writer, sheet_name=name)
-        all_results.drop(columns="item_id").to_excel(writer, sheet_name="forecasts", index=False)
+    try:
+        save_excel(output_file, tables, all_results)
+    except PermissionError:
+        # Windows locks a workbook that is open in Excel: keep this run's results anyway
+        locked_file = output_file
+        output_file = output_file.replace(".xlsx", f"_{pd.Timestamp.now():%Y%m%d_%H%M%S}.xlsx")
+        print(f"\n{locked_file} is locked (open in Excel?), saving to a new file instead")
+        save_excel(output_file, tables, all_results)
     print(f"\nSaved {output_file}")
 
     plot_heatmap(tables["MAFE"], "Chronos2 MAFE by context length and horizon (all origins)",
