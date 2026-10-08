@@ -22,6 +22,8 @@
 #      - mafe_heatmap.png, mafe_by_horizon.png
 #      - sheets PredLen_* : comparaison des horizons demandés
 #      - fan_chart_context_<L>.png : forecasts at FAN_HORIZONS against the observed series
+#      - realised_vs_forecast_context_<L>.png : realised against median forecast, 45° line
+#        and Mincer-Zarnowitz fit (realised = a + b * forecast)
 #                         -----
 #  A.Petronevich et AI
 ############################################################################################
@@ -60,6 +62,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 
 def load_model(model_path):
@@ -333,6 +336,44 @@ def plot_fan_chart(results, df, context, path):
     plt.close(fig)
 
 
+def plot_realised_vs_forecast(results, context, path):
+    """Realised against median forecast, one panel per horizon. Points on the 45° line are
+    perfect forecasts; the Mincer-Zarnowitz fit realised = a + b * forecast should have
+    a = 0 and b = 1 for an unbiased forecast."""
+    sub = results[results["context_length"] == context]
+    horizons = [h for h in FAN_HORIZONS if h <= PREDICTION_LENGTH]
+    fig, axes = plt.subplots(1, len(horizons), figsize=(4.6 * len(horizons), 4.9), squeeze=False)
+    for ax, h in zip(axes[0], horizons):
+        s = sub[sub["horizon"] == h]
+        x, y = s["predictions"].to_numpy(), s["actual"].to_numpy()
+        lo, hi = min(x.min(), y.min()), max(x.max(), y.max())
+        pad = 0.05 * (hi - lo)
+        lims = (lo - pad, hi + pad)
+        ax.plot(lims, lims, color="#8c8c8c", linewidth=1, linestyle="--", label="45° line")
+        ax.scatter(x, y, s=22, color="#2a6fdb", alpha=0.7, edgecolors="white", linewidths=0.5,
+                   label="Forecasts")
+        if len(s) > 2:
+            b, a = np.polyfit(x, y, 1)
+            r2 = np.corrcoef(x, y)[0, 1] ** 2
+            ax.plot(lims, [a + b * v for v in lims], color="#0b3d91", linewidth=2,
+                    label=f"Fit: a = {a:,.{2 if abs(a) < 100 else 0}f}, b = {b:.2f}, R² = {r2:.2f}")
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+        ax.set_aspect("equal")
+        for axis in (ax.xaxis, ax.yaxis):
+            axis.set_major_locator(MaxNLocator(5))
+            axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.{0 if hi - lo >= 100 else 1}f}"))
+        ax.set_title(f"{h}-step-ahead (n = {len(s)})")
+        ax.set_xlabel(f"Forecast (median, {target_unit()})")
+        ax.set_ylabel(f"Realised ({target_unit()})")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=7)
+    fig.suptitle(f"Chronos2 realised vs forecast, context length {context}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_excel(path, tables, all_results):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for name, table in tables.items():
@@ -395,6 +436,8 @@ def main(pipeline=None):
                         os.path.join(output_dir, "mafe_by_horizon.png"))
     for context in tables["MAFE"].index:
         plot_fan_chart(results, df, context, os.path.join(output_dir, f"fan_chart_context_{context}.png"))
+        plot_realised_vs_forecast(results, context,
+                                  os.path.join(output_dir, f"realised_vs_forecast_context_{context}.png"))
     return results, tables
 
 
