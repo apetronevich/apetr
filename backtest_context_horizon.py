@@ -12,9 +12,12 @@
 #      - TARGET_COLUMN : variable à prévoir (sert aussi de réalisé / ground truth)
 #      - CONTEXT_LENGTHS : longueurs de contexte testées (None = tout l'historique)
 #      - PREDICTION_LENGTH : horizon maximal
+#      - EXTRA_PREDICTION_LENGTHS : horizons demandés en plus, pour tester si demander
+#        un horizon plus court change la précision aux horizons communs
 #    Outputs (OUTPUT_DIR):
 #      - backtest_context_horizon.xlsx : prévisions + grilles d'erreur contexte x horizon
 #      - mafe_heatmap.png, mafe_by_horizon.png
+#      - sheets PredLen_* : comparaison des horizons demandés
 #      - fan_chart_context_<L>.png : forecasts at FAN_HORIZONS against the observed series
 #                         -----
 #  A.Petronevich et AI
@@ -33,6 +36,9 @@ USE_COVARIATES = False
 
 FIRST_ORIGIN = "2000-01-01"     # last observed date of the first forecast
 PREDICTION_LENGTH = 11          # horizons 1..PREDICTION_LENGTH
+# Shorter prediction lengths requested in separate runs, compared with the main run
+# on the horizons they share. [] to skip.
+EXTRA_PREDICTION_LENGTHS = [4]
 CONTEXT_LENGTHS = [8, 12, 16, 20, 28, 40, 60, None]   # in periods, None = all history
 # Symmetric pairs give the fan chart bands (90%, 80%, 50%); the widest pair is used for coverage
 QUANTILE_LEVELS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
@@ -96,6 +102,33 @@ def build_contexts(df, origin_positions, context_length):
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
+def forecast(pipeline, df, contexts, prediction_length, position_of, target):
+    # All origins go in a single call, one item_id each
+    pred = pipeline.predict_df(
+        contexts,
+        future_df=None,
+        prediction_length=prediction_length,
+        quantile_levels=QUANTILE_LEVELS,
+        id_column="item_id",
+        timestamp_column="DATE",
+        target=TARGET_COLUMN,
+    )
+    pred = pred.sort_values(["item_id", "DATE"]).reset_index(drop=True)
+    pred["prediction_length"] = prediction_length
+    pred["horizon"] = pred.groupby("item_id").cumcount() + 1
+
+    # Ground truth matched by position (origin + h), not by forecast date,
+    # so it does not depend on how the quarterly dates are stamped
+    origin_pos = pred["item_id"].map(position_of).to_numpy()
+    truth_pos = origin_pos + pred["horizon"].to_numpy()
+    in_sample = truth_pos < len(target)
+    pred["origin"] = pd.to_datetime(pred["item_id"])
+    pred["target_date"] = df["DATE"].reindex(truth_pos).to_numpy()
+    pred["actual"] = np.where(in_sample, target[np.minimum(truth_pos, len(target) - 1)], np.nan)
+    pred["naive"] = target[origin_pos]    # random walk: last observed value
+    return pred
+
+
 def run_backtest(pipeline, df):
     origin_positions = df.index[df["DATE"] >= pd.Timestamp(FIRST_ORIGIN)][:-1]
     position_of = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(df["DATE"])}
@@ -109,31 +142,10 @@ def run_backtest(pipeline, df):
             print(f"  context {label}: no origin with enough history, skipped", flush=True)
             continue
         print(f"  context {label}: {contexts['item_id'].nunique()} origins", flush=True)
-
-        # All origins go in a single call, one item_id each
-        pred = pipeline.predict_df(
-            contexts,
-            future_df=None,
-            prediction_length=PREDICTION_LENGTH,
-            quantile_levels=QUANTILE_LEVELS,
-            id_column="item_id",
-            timestamp_column="DATE",
-            target=TARGET_COLUMN,
-        )
-        pred = pred.sort_values(["item_id", "DATE"]).reset_index(drop=True)
-        pred["context_length"] = label
-        pred["horizon"] = pred.groupby("item_id").cumcount() + 1
-
-        # Ground truth matched by position (origin + h), not by forecast date,
-        # so it does not depend on how the quarterly dates are stamped
-        origin_pos = pred["item_id"].map(position_of).to_numpy()
-        truth_pos = origin_pos + pred["horizon"].to_numpy()
-        in_sample = truth_pos < len(target)
-        pred["origin"] = pd.to_datetime(pred["item_id"])
-        pred["target_date"] = df["DATE"].reindex(truth_pos).to_numpy()
-        pred["actual"] = np.where(in_sample, target[np.minimum(truth_pos, len(target) - 1)], np.nan)
-        pred["naive"] = target[origin_pos]    # random walk: last observed value
-        results.append(pred)
+        for prediction_length in [PREDICTION_LENGTH] + EXTRA_PREDICTION_LENGTHS:
+            pred = forecast(pipeline, df, contexts, prediction_length, position_of, target)
+            pred["context_length"] = label
+            results.append(pred)
 
     results = pd.concat(results, ignore_index=True).dropna(subset=["actual"])
     results["error"] = results["predictions"] - results["actual"]
@@ -188,6 +200,25 @@ def evaluate(results):
     if "inside_interval" in results:
         tables["Coverage_widest"] = grid(results.assign(cov=results["inside_interval"].astype(float)), "cov")
     return tables, common_origins
+
+
+def compare_prediction_lengths(results):
+    """MAFE of each requested prediction length on the horizons they all share, and the
+    largest gap between their median forecasts for the same origin and horizon
+    (0 means the requested length does not change the forecasts at all)."""
+    lengths = sorted(results["prediction_length"].unique())
+    order = [context_label(c) for c in CONTEXT_LENGTHS if context_label(c) in set(results["context_length"])]
+    shared = results[results["horizon"] <= min(lengths)]
+
+    mafe = shared.pivot_table(index=["context_length", "prediction_length"], columns="horizon", values="abs_error")
+    mafe = mafe.reindex(pd.MultiIndex.from_product([order, lengths], names=mafe.index.names)).dropna(how="all")
+
+    medians = shared.pivot_table(index=["context_length", "origin", "horizon"],
+                                 columns="prediction_length", values="predictions")
+    gap = medians.sub(medians[PREDICTION_LENGTH], axis=0).abs().groupby(level="context_length").max()
+    gap = gap.reindex(order).drop(columns=PREDICTION_LENGTH)
+    gap.columns = [f"max |median({c}) - median({PREDICTION_LENGTH})|" for c in gap.columns]
+    return {"PredLen_MAFE": mafe, "PredLen_max_gap": gap}
 
 
 ################## Plot #####################################
@@ -276,7 +307,15 @@ def main(pipeline=None):
     results = run_backtest(pipeline, df)
 
     print("Step 4 - Evaluation", flush=True)
+    all_results = results
+    results = all_results[all_results["prediction_length"] == PREDICTION_LENGTH]
     tables, common_origins = evaluate(results)
+    if EXTRA_PREDICTION_LENGTHS:
+        tables.update(compare_prediction_lengths(all_results))
+        print("\nMAFE by requested prediction length, on the horizons they share:")
+        print(tables["PredLen_MAFE"].round(0).to_string())
+        print("\nLargest gap between median forecasts (0 = requested length has no effect):")
+        print(tables["PredLen_max_gap"].round(2).to_string())
     print("\nMAFE, full sample (context length x horizon):")
     print(tables["MAFE"].round(0).to_string())
     if len(common_origins):
@@ -287,7 +326,7 @@ def main(pipeline=None):
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         for name, table in tables.items():
             table.to_excel(writer, sheet_name=name)
-        results.drop(columns="item_id").to_excel(writer, sheet_name="forecasts", index=False)
+        all_results.drop(columns="item_id").to_excel(writer, sheet_name="forecasts", index=False)
     print(f"\nSaved {output_file}")
 
     plot_heatmap(tables["MAFE"], "Chronos2 MAFE by context length and horizon (all origins)",
