@@ -10,12 +10,15 @@
 #      - chemin vers stockage modèle MODEL_PATH
 #      - INPUT_FILE : fichier excel de sortie eviews (colonne DATE + TARGET_COLUMN)
 #      - TARGET_COLUMN : variable à prévoir (sert aussi de réalisé / ground truth)
+#      - TARGET_TRANSFORM : "level" ou "qoq" (taux de croissance t/t-1 en %, covariables
+#        non transformées). En "qoq" les erreurs sont en points de croissance, et la
+#        feuille MAFE_level_implied donne l'erreur sur le niveau reconstruit
 #      - CONTEXT_LENGTHS : longueurs de contexte testées (None = tout l'historique)
 #      - PREDICTION_LENGTH : horizon maximal
 #      - EXTRA_PREDICTION_LENGTHS : horizons demandés en plus, pour tester si demander
 #        un horizon plus court change la précision aux horizons communs
 #    Outputs (OUTPUT_DIR):
-#      - backtest_context_horizon.xlsx : prévisions + grilles d'erreur contexte x horizon
+#      - backtest_context_horizon.xlsx (dans OUTPUT_DIR/<TARGET_TRANSFORM>) : prévisions + grilles d'erreur contexte x horizon
 #      - mafe_heatmap.png, mafe_by_horizon.png
 #      - sheets PredLen_* : comparaison des horizons demandés
 #      - fan_chart_context_<L>.png : forecasts at FAN_HORIZONS against the observed series
@@ -29,6 +32,9 @@
 MODEL_PATH = "C:\\TSFM"
 INPUT_FILE = "Inputs/RawDataInvMPEMars2026_wocovariates.xlsx"
 TARGET_COLUMN = "P51_S11S12S14A_7CH"
+# "level": forecast the series as is. "qoq": forecast the quarter-on-quarter growth rate
+# in % (covariates are left untransformed). Outputs go to OUTPUT_DIR/<TARGET_TRANSFORM>.
+TARGET_TRANSFORM = "qoq"
 
 # False: target only (zero-shot). True: every other column of INPUT_FILE is used as a
 # past covariate (no future covariates, they would not be known at the origin).
@@ -38,7 +44,7 @@ FIRST_ORIGIN = "2000-01-01"     # last observed date of the first forecast
 PREDICTION_LENGTH = 11          # horizons 1..PREDICTION_LENGTH
 # Shorter prediction lengths requested in separate runs, compared with the main run
 # on the horizons they share. [] to skip.
-EXTRA_PREDICTION_LENGTHS = [4]
+EXTRA_PREDICTION_LENGTHS = []
 CONTEXT_LENGTHS = [8, 12, 16, 20, 28, 40, 60, None]   # in periods, None = all history
 # Symmetric pairs give the fan chart bands (90%, 80%, 50%); the widest pair is used for coverage
 QUANTILE_LEVELS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
@@ -73,13 +79,25 @@ def load_model(model_path):
 #####################  Get the data  ######################################################
 
 def load_data(path):
+    """Returns the model data (target transformed per TARGET_TRANSFORM) and the target
+    in levels, aligned row by row."""
     df = pd.read_excel(path)
     df["DATE"] = pd.to_datetime(df["DATE"])
     if not USE_COVARIATES:
         df = df[["DATE", TARGET_COLUMN]]
     # eviews exports can carry empty rows after the last observation
-    df = df.dropna(subset=[TARGET_COLUMN])
-    return df.sort_values("DATE").reset_index(drop=True)
+    df = df.dropna(subset=[TARGET_COLUMN]).sort_values("DATE").reset_index(drop=True)
+    levels = df[TARGET_COLUMN].copy()
+    if TARGET_TRANSFORM == "qoq":
+        df[TARGET_COLUMN] = 100 * df[TARGET_COLUMN].pct_change()
+        df, levels = df.iloc[1:], levels.iloc[1:]
+    elif TARGET_TRANSFORM != "level":
+        raise ValueError(f"TARGET_TRANSFORM inconnu : {TARGET_TRANSFORM}")
+    return df.reset_index(drop=True), levels.reset_index(drop=True)
+
+
+def target_unit():
+    return "q-o-q growth, %" if TARGET_TRANSFORM == "qoq" else "level"
 
 
 def context_label(context_length):
@@ -126,10 +144,23 @@ def forecast(pipeline, df, contexts, prediction_length, position_of, target):
     pred["target_date"] = df["DATE"].reindex(truth_pos).to_numpy()
     pred["actual"] = np.where(in_sample, target[np.minimum(truth_pos, len(target) - 1)], np.nan)
     pred["naive"] = target[origin_pos]    # random walk: last observed value
+    pred["origin_pos"] = origin_pos
     return pred
 
 
-def run_backtest(pipeline, df):
+def implied_levels(pred, levels):
+    """Level path implied by the median growth forecasts: level at the origin compounded
+    by the forecast growth rates up to each horizon."""
+    growth = 1 + pred["predictions"] / 100
+    keys = ["context_length", "prediction_length", "item_id"]
+    level_origin = levels.to_numpy()[pred["origin_pos"].to_numpy()]
+    implied = level_origin * growth.groupby([pred[k] for k in keys]).cumprod().to_numpy()
+    truth_pos = pred["origin_pos"].to_numpy() + pred["horizon"].to_numpy()
+    actual = levels.reindex(truth_pos).to_numpy()
+    return implied, actual
+
+
+def run_backtest(pipeline, df, levels):
     origin_positions = df.index[df["DATE"] >= pd.Timestamp(FIRST_ORIGIN)][:-1]
     position_of = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(df["DATE"])}
     target = df[TARGET_COLUMN].to_numpy()
@@ -147,10 +178,16 @@ def run_backtest(pipeline, df):
             pred["context_length"] = label
             results.append(pred)
 
-    results = pd.concat(results, ignore_index=True).dropna(subset=["actual"])
+    results = pd.concat(results, ignore_index=True)
+    if TARGET_TRANSFORM == "qoq":
+        results["level_implied"], results["level_actual"] = implied_levels(results, levels)
+        results["abs_error_level"] = (results["level_implied"] - results["level_actual"]).abs()
+    results = results.dropna(subset=["actual"])
     results["error"] = results["predictions"] - results["actual"]
     results["abs_error"] = results["error"].abs()
-    results["abs_pct_error"] = 100 * results["abs_error"] / results["actual"].abs()
+    if TARGET_TRANSFORM == "level":
+        # a percentage of a growth rate close to zero is meaningless
+        results["abs_pct_error"] = 100 * results["abs_error"] / results["actual"].abs()
     results["abs_error_naive"] = (results["naive"] - results["actual"]).abs()
 
     quantile_cols = [c for c in results.columns if _is_number(c)]
@@ -190,13 +227,17 @@ def evaluate(results):
     tables = {
         "MAFE": grid(results, "abs_error"),
         "RMSE": np.sqrt(grid(squared, "sq")),
-        "MAPE": grid(results, "abs_pct_error"),
         "MAFE_vs_RW": grid(results, "abs_error") / grid(results, "abs_error_naive"),
         "MAFE_common": grid(common, "abs_error"),
         "RMSE_common": np.sqrt(grid(common_sq, "sq")),
         "MAFE_vs_RW_common": grid(common, "abs_error") / grid(common, "abs_error_naive"),
         "N_forecasts": grid(results, "abs_error", how="count"),
     }
+    if "abs_pct_error" in results:
+        tables["MAPE"] = grid(results, "abs_pct_error")
+    if "abs_error_level" in results:
+        tables["MAFE_level_implied"] = grid(results, "abs_error_level")
+        tables["MAFE_level_implied_common"] = grid(common, "abs_error_level")
     if "inside_interval" in results:
         tables["Coverage_widest"] = grid(results.assign(cov=results["inside_interval"].astype(float)), "cov")
     return tables, common_origins
@@ -237,9 +278,9 @@ def plot_heatmap(table, title, path):
     for i in range(values.shape[0]):
         for j in range(values.shape[1]):
             if not np.isnan(values[i, j]):
-                ax.text(j, i, f"{values[i, j]:,.0f}", ha="center", va="center", fontsize=8,
+                ax.text(j, i, f"{values[i, j]:,.{0 if np.nanmax(values) >= 100 else 2}f}", ha="center", va="center", fontsize=8,
                         color="white" if values[i, j] > threshold else "#1f1f1f")
-    fig.colorbar(im, ax=ax, label="MAFE")
+    fig.colorbar(im, ax=ax, label=f"MAFE ({target_unit()})")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -252,7 +293,7 @@ def plot_by_horizon(table, title, path):
     for color, (label, row) in zip(colors, table.iterrows()):
         ax.plot(row.index, row.values, marker="o", markersize=4, linewidth=2, color=color, label=label)
     ax.set_xlabel("Horizon")
-    ax.set_ylabel("MAFE")
+    ax.set_ylabel(f"MAFE ({target_unit()})")
     ax.set_title(title)
     ax.set_xticks(table.columns)
     ax.grid(alpha=0.3)
@@ -283,7 +324,7 @@ def plot_fan_chart(results, df, context, path):
         ax.plot(s["target_date"], s["predictions"], color="#0b3d91", linewidth=1.5, label="Median forecast")
         ax.plot(observed["DATE"], observed[TARGET_COLUMN], color="#1f1f1f", linewidth=2, label="Observed")
         ax.set_title(f"{h}-step-ahead forecasts")
-        ax.set_ylabel(TARGET_COLUMN)
+        ax.set_ylabel(f"{TARGET_COLUMN}\n({target_unit()})")
         ax.grid(alpha=0.3)
     axes[0, 0].legend(loc="upper left", fontsize=8)
     fig.suptitle(f"Chronos2 forecasts vs observed, context length {context}")
@@ -302,16 +343,18 @@ def save_excel(path, tables, all_results):
 ################## Main #####################################
 
 def main(pipeline=None):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = os.path.join(OUTPUT_DIR, TARGET_TRANSFORM)
+    os.makedirs(output_dir, exist_ok=True)
     if pipeline is None:
         pipeline = load_model(MODEL_PATH)
 
     print("Step 2 - Load data", flush=True)
-    df = load_data(INPUT_FILE)
+    df, levels = load_data(INPUT_FILE)
     print(f"  {len(df)} observations, {df['DATE'].min():%Y-%m-%d} to {df['DATE'].max():%Y-%m-%d}", flush=True)
 
     print("Step 3 - Rolling forecasts", flush=True)
-    results = run_backtest(pipeline, df)
+    print(f"  target: {TARGET_COLUMN} ({target_unit()})", flush=True)
+    results = run_backtest(pipeline, df, levels)
 
     print("Step 4 - Evaluation", flush=True)
     all_results = results
@@ -324,12 +367,15 @@ def main(pipeline=None):
         print("\nLargest gap between median forecasts (0 = requested length has no effect):")
         print(tables["PredLen_max_gap"].round(2).to_string())
     print("\nMAFE, full sample (context length x horizon):")
-    print(tables["MAFE"].round(0).to_string())
+    print(tables["MAFE"].round(2).to_string())
     if len(common_origins):
         print(f"\nMAFE, common sample ({common_origins.min():%Y-%m-%d} to {common_origins.max():%Y-%m-%d} origins):")
-        print(tables["MAFE_common"].round(0).to_string())
+        print(tables["MAFE_common"].round(2).to_string())
+    if "MAFE_level_implied_common" in tables:
+        print("\nMAFE on the level implied by the growth forecasts, common sample:")
+        print(tables["MAFE_level_implied_common"].round(0).to_string())
 
-    output_file = os.path.join(OUTPUT_DIR, "backtest_context_horizon.xlsx")
+    output_file = os.path.join(output_dir, "backtest_context_horizon.xlsx")
     try:
         save_excel(output_file, tables, all_results)
     except PermissionError:
@@ -340,15 +386,15 @@ def main(pipeline=None):
         save_excel(output_file, tables, all_results)
     print(f"\nSaved {output_file}")
 
-    plot_heatmap(tables["MAFE"], "Chronos2 MAFE by context length and horizon (all origins)",
-                 os.path.join(OUTPUT_DIR, "mafe_heatmap.png"))
+    plot_heatmap(tables["MAFE"], f"Chronos2 MAFE, {target_unit()}, by context length and horizon (all origins)",
+                 os.path.join(output_dir, "mafe_heatmap.png"))
     if len(common_origins):
-        plot_heatmap(tables["MAFE_common"], "Chronos2 MAFE by context length and horizon (common sample)",
-                     os.path.join(OUTPUT_DIR, "mafe_heatmap_common.png"))
-        plot_by_horizon(tables["MAFE_common"], "Chronos2 MAFE by horizon (common sample)",
-                        os.path.join(OUTPUT_DIR, "mafe_by_horizon.png"))
+        plot_heatmap(tables["MAFE_common"], f"Chronos2 MAFE, {target_unit()}, by context length and horizon (common sample)",
+                     os.path.join(output_dir, "mafe_heatmap_common.png"))
+        plot_by_horizon(tables["MAFE_common"], f"Chronos2 MAFE, {target_unit()}, by horizon (common sample)",
+                        os.path.join(output_dir, "mafe_by_horizon.png"))
     for context in tables["MAFE"].index:
-        plot_fan_chart(results, df, context, os.path.join(OUTPUT_DIR, f"fan_chart_context_{context}.png"))
+        plot_fan_chart(results, df, context, os.path.join(output_dir, f"fan_chart_context_{context}.png"))
     return results, tables
 
 
