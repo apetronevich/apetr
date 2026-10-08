@@ -15,6 +15,7 @@
 #    Outputs (OUTPUT_DIR):
 #      - backtest_context_horizon.xlsx : prévisions + grilles d'erreur contexte x horizon
 #      - mafe_heatmap.png, mafe_by_horizon.png
+#      - fan_chart_context_<L>.png : forecasts at FAN_HORIZONS against the observed series
 #                         -----
 #  A.Petronevich et AI
 ############################################################################################
@@ -33,7 +34,9 @@ USE_COVARIATES = False
 FIRST_ORIGIN = "2000-01-01"     # last observed date of the first forecast
 PREDICTION_LENGTH = 11          # horizons 1..PREDICTION_LENGTH
 CONTEXT_LENGTHS = [8, 12, 16, 20, 28, 40, 60, None]   # in periods, None = all history
-QUANTILE_LEVELS = [0.1, 0.5, 0.9]
+# Symmetric pairs give the fan chart bands (90%, 80%, 50%); the widest pair is used for coverage
+QUANTILE_LEVELS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+FAN_HORIZONS = [1, 4, 8]       # one panel per horizon in the fan charts
 
 OUTPUT_DIR = "Outputs/backtest_context_horizon"
 
@@ -183,7 +186,7 @@ def evaluate(results):
         "N_forecasts": grid(results, "abs_error", how="count"),
     }
     if "inside_interval" in results:
-        tables["Coverage"] = grid(results.assign(cov=results["inside_interval"].astype(float)), "cov")
+        tables["Coverage_widest"] = grid(results.assign(cov=results["inside_interval"].astype(float)), "cov")
     return tables, common_origins
 
 
@@ -228,6 +231,36 @@ def plot_by_horizon(table, title, path):
     plt.close(fig)
 
 
+def plot_fan_chart(results, df, context, path):
+    """For each horizon h, the forecast made h periods before each date, plotted at
+    that date against the observed series."""
+    sub = results[results["context_length"] == context]
+    quantiles = {float(c): c for c in sub.columns if _is_number(c)}
+    # Symmetric quantile pairs, widest first so narrower bands are painted on top
+    bands = sorted((q, 1 - q) for q in quantiles if q < 0.5 and any(abs(1 - q - p) < 1e-9 for p in quantiles))
+    band_colors = plt.cm.Blues(np.linspace(0.25, 0.55, max(len(bands), 1)))
+    horizons = [h for h in FAN_HORIZONS if h <= PREDICTION_LENGTH]
+    observed = df[df["DATE"] >= sub["target_date"].min() - pd.DateOffset(years=1)]
+
+    fig, axes = plt.subplots(len(horizons), 1, figsize=(11, 3.4 * len(horizons)), sharex=True, squeeze=False)
+    for ax, h in zip(axes[:, 0], horizons):
+        s = sub[sub["horizon"] == h].sort_values("target_date")
+        for color, (lo, hi) in zip(band_colors, bands):
+            hi_col = next(c for q, c in quantiles.items() if abs(q - hi) < 1e-9)
+            ax.fill_between(s["target_date"], s[quantiles[lo]], s[hi_col], color=color, linewidth=0,
+                            label=f"{round(100 * (hi - lo))}% interval")
+        ax.plot(s["target_date"], s["predictions"], color="#0b3d91", linewidth=1.5, label="Median forecast")
+        ax.plot(observed["DATE"], observed[TARGET_COLUMN], color="#1f1f1f", linewidth=2, label="Observed")
+        ax.set_title(f"{h}-step-ahead forecasts")
+        ax.set_ylabel(TARGET_COLUMN)
+        ax.grid(alpha=0.3)
+    axes[0, 0].legend(loc="upper left", fontsize=8)
+    fig.suptitle(f"Chronos2 forecasts vs observed, context length {context}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 ################## Main #####################################
 
 def main(pipeline=None):
@@ -264,6 +297,8 @@ def main(pipeline=None):
                      os.path.join(OUTPUT_DIR, "mafe_heatmap_common.png"))
         plot_by_horizon(tables["MAFE_common"], "Chronos2 MAFE by horizon (common sample)",
                         os.path.join(OUTPUT_DIR, "mafe_by_horizon.png"))
+    for context in tables["MAFE"].index:
+        plot_fan_chart(results, df, context, os.path.join(OUTPUT_DIR, f"fan_chart_context_{context}.png"))
     return results, tables
 
 
