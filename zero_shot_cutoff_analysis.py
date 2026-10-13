@@ -20,7 +20,7 @@
 #      - WINDOW_QUARTERS : None = fenêtre glissante croissante (expanding), 40 = 10 ans glissants
 #    Outputs (OUTPUT_DIR/<expanding|rolling40>/<level|qoq>) :
 #      - zero_shot_cutoff.xlsx : prévisions, erreurs coupure x horizon, métriques,
-#        avec une ligne "Average" par horizon
+#        avec en bas de chaque tableau les moyennes par horizon (MAFE, RMSE, biais, MAPE)
 #      - heatmap_<métrique>.png : coupure en vertical, horizon en horizontal
 #      - hair_chart.png : réalisé + une prévision ("cheveu") par date de coupure
 #                         -----
@@ -191,28 +191,27 @@ def run_forecasts(pipeline, series):
 
 ################## Forecast evaluation ######################
 
+# Row label under each table -> column of the by_horizon table
+SUMMARY_ROWS = {"Average MAFE": "MAFE", "Average RMSE": "RMSE",
+                "Average bias": "Bias (mean error)", "Average MAPE": "MAPE"}
+
+
 def evaluate(results, transform):
     scored = results.dropna(subset=["actual"])
     if transform == "level":
         # a percentage of a growth rate close to zero is meaningless
         scored = scored.assign(ape=100 * scored["abs_error"] / scored["actual"].abs())
 
-    # Last row "Average": mean over every scored forecast at that horizon, so it equals
-    # the MAFE / bias / MAPE of the by_horizon table (and the RMSE once square-rooted)
-    def with_average(table, value):
-        table.loc["Average"] = scored.groupby("horizon")[value].mean()
-        return table
-
     def by_cutoff(value):
         table = scored.pivot_table(index="cutoff", columns="horizon", values=value)
         table.index = [quarter_label(d) for d in table.index]
-        return with_average(table, value)
+        return table
 
     def by_year(value):
         table = scored.assign(year=scored["cutoff"].dt.year).pivot_table(
             index="year", columns="horizon", values=value)
         table.index = table.index.astype(str)
-        return with_average(table, value)
+        return table
 
     def summary(frame):
         out = {"MAFE": frame["abs_error"].mean(),
@@ -230,13 +229,19 @@ def evaluate(results, transform):
         per_cutoff["ape"] = by_cutoff("ape")
         per_year["MAPE"] = by_year("ape")
     by_horizon = scored.groupby("horizon").apply(summary, include_groups=False)
-    return per_cutoff, per_year, by_horizon
+
+    # Shown under every table: each metric over all scored forecasts at that horizon
+    averages = by_horizon[[c for c in SUMMARY_ROWS.values() if c in by_horizon]].T
+    averages.index = [label for label, c in SUMMARY_ROWS.items() if c in by_horizon]
+    return per_cutoff, per_year, averages, by_horizon
 
 
 ################## Plot #####################################
 
-def plot_heatmap(table, title, colorbar_label, path, diverging=False, annotate=False):
-    values = table.to_numpy(dtype=float)
+def plot_heatmap(body, averages, title, colorbar_label, path, diverging=False, annotate=False):
+    """body is the coloured heatmap; the averages rows mix metrics and units, so they are
+    printed as plain numbers in a panel of their own underneath, columns aligned."""
+    values = body.to_numpy(dtype=float)
     finite = values[np.isfinite(values)]
     if diverging:
         limit = np.percentile(np.abs(finite), ROBUST_PERCENTILE)
@@ -245,36 +250,43 @@ def plot_heatmap(table, title, colorbar_label, path, diverging=False, annotate=F
         vmin, vmax, cmap = 0, np.percentile(finite, ROBUST_PERCENTILE), plt.get_cmap("Blues").copy()
     cmap.set_bad("#e6e6e6")    # targets after LAST_FINAL: no ground truth
 
-    n_rows = len(table)
-    row_height = 0.11 if n_rows > 40 else 0.3
-    fig, ax = plt.subplots(figsize=(10, max(row_height * n_rows, 4) + 1.5))
+    n_body, n_cols = values.shape
+    body_height = max((0.11 if n_body > 40 else 0.3) * n_body, 3)
+    averages_height = 0.3 * len(averages)
+    fig, (ax, ax_avg) = plt.subplots(
+        2, 1, figsize=(10, body_height + averages_height + 1.5), sharex=True, layout="constrained",
+        gridspec_kw={"height_ratios": [body_height, averages_height]})
+
     im = ax.imshow(np.ma.masked_invalid(values), cmap=cmap, vmin=vmin, vmax=vmax,
                    aspect="auto", interpolation="nearest")
-    ax.set_xticks(range(table.shape[1]), table.columns)
-    step = 4 if n_rows > 40 else 1
-    ticks = list(range(0, n_rows - 1, step)) + [n_rows - 1]    # always label the Average row
-    ax.set_yticks(ticks, table.index[ticks])
-    has_average = table.index[-1] == "Average"
-    if has_average:
-        ax.axhline(n_rows - 1.5, color="white", linewidth=3)
-    ax.set_xlabel("Forecast horizon (quarters)")
+    step = 4 if n_body > 40 else 1
+    ax.set_yticks(range(0, n_body, step), body.index[::step])
     ax.set_ylabel("Forecast cut-off")
     ax.set_title(title)
+    ax.tick_params(axis="x", bottom=False)
+    if annotate:
+        decimals = 0 if np.nanmax(np.abs(finite)) >= 100 else 2
+        for i in range(n_body):
+            for j in range(n_cols):
+                v = values[i, j]
+                if np.isfinite(v):
+                    dark = abs(v) > 0.6 * vmax if diverging else v > 0.6 * vmax
+                    ax.text(j, i, f"{v:,.{decimals}f}", ha="center", va="center", fontsize=6.5,
+                            color="white" if dark else "#1f1f1f")
 
-    decimals = 0 if np.nanmax(np.abs(finite)) >= 100 else 2
-    annotated_rows = range(values.shape[0]) if annotate else ([n_rows - 1] if has_average else [])
-    for i in annotated_rows:
-        for j in range(values.shape[1]):
-            v = values[i, j]
+    ax_avg.set_ylim(len(averages) - 0.5, -0.5)
+    ax_avg.set_yticks(range(len(averages)), averages.index)
+    for i, (_, row) in enumerate(averages.iterrows()):
+        decimals = 0 if np.nanmax(np.abs(row.to_numpy(dtype=float))) >= 100 else 2
+        for j, v in enumerate(row.to_numpy(dtype=float)):
             if np.isfinite(v):
-                dark = abs(v) > 0.6 * vmax if diverging else v > 0.6 * vmax
-                ax.text(j, i, f"{v:,.{decimals}f}", ha="center", va="center", fontsize=6.5,
-                        color="white" if dark else "#1f1f1f",
-                        fontweight="bold" if i == n_rows - 1 and has_average else "normal")
+                ax_avg.text(j, i, f"{v:,.{decimals}f}", ha="center", va="center", fontsize=7,
+                            color="#1f1f1f", fontweight="bold")
+    ax_avg.set_xticks(range(n_cols), body.columns)
+    ax_avg.set_xlabel("Forecast horizon (quarters)")
 
-    extend = "both" if diverging else "max"
-    fig.colorbar(im, ax=ax, label=colorbar_label, extend=extend, shrink=0.6 if n_rows > 40 else 1.0)
-    fig.tight_layout()
+    fig.colorbar(im, ax=[ax, ax_avg], label=colorbar_label, extend="both" if diverging else "max",
+                 shrink=0.6 if n_body > 40 else 1.0)
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -318,13 +330,13 @@ def plot_hair_chart(results, series, transform, path):
 
 ################## Save #####################################
 
-def save_excel(path, results, per_cutoff, per_year, by_horizon):
+def save_excel(path, results, per_cutoff, per_year, averages, by_horizon):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         by_horizon.to_excel(writer, sheet_name="by_horizon")
         for name, table in per_cutoff.items():
-            table.to_excel(writer, sheet_name=f"{name}_by_cutoff")
+            pd.concat([table, averages]).to_excel(writer, sheet_name=f"{name}_by_cutoff")
         for name, table in per_year.items():
-            table.to_excel(writer, sheet_name=f"{name}_by_year")
+            pd.concat([table, averages]).to_excel(writer, sheet_name=f"{name}_by_year")
         results.to_excel(writer, sheet_name="forecasts", index=False)
 
 
@@ -362,20 +374,23 @@ def run_exercise(pipeline, data, transform):
 
     series = data[["DATE", transform]].rename(columns={transform: TARGET_COLUMN}).dropna().reset_index(drop=True)
     results = run_forecasts(pipeline, series)
-    per_cutoff, per_year, by_horizon = evaluate(results, transform)
+    per_cutoff, per_year, averages, by_horizon = evaluate(results, transform)
 
     print("\n  Metrics by horizon, all cut-offs:")
     print(by_horizon.round(2).to_string())
-    save_excel_unlocked(os.path.join(output_dir, "zero_shot_cutoff.xlsx"), results, per_cutoff, per_year, by_horizon)
+    save_excel_unlocked(os.path.join(output_dir, "zero_shot_cutoff.xlsx"), results, per_cutoff, per_year, averages,
+                        by_horizon)
 
     for name, table in per_cutoff.items():
         label, diverging = HEATMAPS_PER_CUTOFF[name]
-        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label.lower()} of each forecast",
+        plot_heatmap(table, averages,
+                     f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label.lower()} of each forecast",
                      f"{label} ({unit(transform)})" if name != "ape" else label,
                      os.path.join(output_dir, f"heatmap_{name}_by_cutoff.png"), diverging=diverging)
     for name, table in per_year.items():
         label, diverging = HEATMAPS_PER_YEAR[name]
-        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label} over the cut-offs of each year",
+        plot_heatmap(table, averages,
+                     f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label} over the cut-offs of each year",
                      f"{label} ({unit(transform)})" if name != "MAPE" else label,
                      os.path.join(output_dir, f"heatmap_{name}_by_year.png"), diverging=diverging, annotate=True)
     plot_hair_chart(results, series, transform, os.path.join(output_dir, "hair_chart.png"))
