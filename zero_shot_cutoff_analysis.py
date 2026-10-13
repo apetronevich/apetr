@@ -4,7 +4,8 @@
 #                         -----
 #    For every cut-off date from FIRST_CUTOFF on, Chronos2 forecasts TARGET_COLUMN
 #    1..PREDICTION_LENGTH quarters ahead, zero-shot (no covariates, no future covariates),
-#    from all the history up to the cut-off (expanding window). The exercise is run for
+#    from the history up to the cut-off: all of it (expanding window) or only the last
+#    WINDOW_QUARTERS quarters (rolling window). The exercise is run for
 #    the target in level and in q-o-q growth rate. The BMPE series is both the model
 #    input and the ground truth.
 #
@@ -13,7 +14,8 @@
 #      - BMPE_FILE : export excel du BMPE de juin 2026 (colonne DATE + TARGET_COLUMN)
 #      - LAST_OBSERVED : dernier trimestre observé du BMPE ; les trimestres suivants sont
 #        des projections et sont exclus (ni contexte, ni réalisé)
-#    Outputs (OUTPUT_DIR/<level|qoq>) :
+#      - WINDOW_QUARTERS : None = fenêtre glissante croissante (expanding), 40 = 10 ans glissants
+#    Outputs (OUTPUT_DIR/<expanding|rolling40>/<level|qoq>) :
 #      - zero_shot_cutoff.xlsx : prévisions, erreurs coupure x horizon, métriques
 #      - heatmap_<métrique>.png : coupure en vertical, horizon en horizontal
 #      - hair_chart.png : réalisé + une prévision ("cheveu") par date de coupure
@@ -33,6 +35,10 @@ TARGET_COLUMN = "P51_S11S12S14A_7CH"   # matched ignoring case
 LAST_OBSERVED = "2026-01-01"    # 2026Q1 ; None = keep every non-empty row
 
 FIRST_CUTOFF = "2000-01-01"     # 2000Q1, last quarter in the context of the first forecast
+# None: expanding window (all history up to the cut-off). 40: rolling window of the last
+# 10 years. Cut-offs with fewer than WINDOW_QUARTERS quarters of history are skipped,
+# so with a rolling window every forecast sees exactly the same amount of data.
+WINDOW_QUARTERS = 40
 PREDICTION_LENGTH = 12          # horizons 1..12
 TRANSFORMS = ["level", "qoq"]   # target in level, then in q-o-q growth rate (%)
 QUANTILE_LEVELS = [0.1, 0.5, 0.9]
@@ -99,6 +105,14 @@ def quarter_label(date):
     return f"{date.year}Q{date.quarter}"
 
 
+def window_name():
+    return "expanding" if WINDOW_QUARTERS is None else f"rolling{WINDOW_QUARTERS}"
+
+
+def window_label():
+    return "expanding window" if WINDOW_QUARTERS is None else f"rolling {WINDOW_QUARTERS}-quarter window"
+
+
 def unit(transform):
     return "q-o-q growth, %" if transform == "qoq" else "level"
 
@@ -106,12 +120,23 @@ def unit(transform):
 ################## Generate predictions ####################
 
 def run_forecasts(pipeline, series):
-    """Zero-shot forecasts from every cut-off, expanding window. series has DATE and
-    TARGET_COLUMN, one row per quarter."""
+    """Zero-shot forecasts from every cut-off, expanding or rolling window. series has
+    DATE and TARGET_COLUMN, one row per quarter."""
     last = len(series) - 1
     cutoffs = series.index[(series["DATE"] >= pd.Timestamp(FIRST_CUTOFF)) & (series.index < last)]
+    if WINDOW_QUARTERS is not None:
+        too_short = cutoffs[cutoffs + 1 < WINDOW_QUARTERS]
+        cutoffs = cutoffs[cutoffs + 1 >= WINDOW_QUARTERS]
+        if len(too_short):
+            print(f"  {len(too_short)} cut-offs skipped ({quarter_label(series['DATE'].iloc[too_short[0]])} to "
+                  f"{quarter_label(series['DATE'].iloc[too_short[-1]])}): less than {WINDOW_QUARTERS} quarters "
+                  f"of history, the series starts in {quarter_label(series['DATE'].iloc[0])}", flush=True)
+        if not len(cutoffs):
+            raise ValueError(f"No cut-off has {WINDOW_QUARTERS} quarters of history")
+    start = (lambda pos: 0) if WINDOW_QUARTERS is None else (lambda pos: pos + 1 - WINDOW_QUARTERS)
     contexts = pd.concat(
-        [series.iloc[:pos + 1].assign(item_id=series["DATE"].iloc[pos].strftime("%Y-%m-%d")) for pos in cutoffs],
+        [series.iloc[start(pos):pos + 1].assign(item_id=series["DATE"].iloc[pos].strftime("%Y-%m-%d"))
+         for pos in cutoffs],
         ignore_index=True,
     )
     print(f"  {len(cutoffs)} cut-offs, {quarter_label(series['DATE'].iloc[cutoffs[0]])} "
@@ -248,7 +273,8 @@ def plot_hair_chart(results, series, transform, path):
         ax.text(0.99, 0.98, "y-axis limited to the 1st-99th percentile range of the realised series", transform=ax.transAxes,
                 ha="right", va="top", fontsize=8, color="#595959")
 
-    ax.set_title(f"Chronos2 zero-shot forecasts from each cut-off, {TARGET_COLUMN} ({unit(transform)})")
+    ax.set_title(f"Chronos2 zero-shot forecasts from each cut-off, {window_label()}, "
+                 f"{TARGET_COLUMN} ({unit(transform)})")
     ax.set_ylabel(f"{TARGET_COLUMN} ({unit(transform)})")
     ax.grid(alpha=0.3)
     ax.legend(loc="upper left")
@@ -297,8 +323,8 @@ HEATMAPS_PER_YEAR = {
 
 
 def run_exercise(pipeline, data, transform):
-    print(f"\nTarget: {TARGET_COLUMN}, {unit(transform)}", flush=True)
-    output_dir = os.path.join(OUTPUT_DIR, transform)
+    print(f"\nTarget: {TARGET_COLUMN}, {unit(transform)}, {window_label()}", flush=True)
+    output_dir = os.path.join(OUTPUT_DIR, window_name(), transform)
     os.makedirs(output_dir, exist_ok=True)
 
     series = data[["DATE", transform]].rename(columns={transform: TARGET_COLUMN}).dropna().reset_index(drop=True)
@@ -311,12 +337,12 @@ def run_exercise(pipeline, data, transform):
 
     for name, table in per_cutoff.items():
         label, diverging = HEATMAPS_PER_CUTOFF[name]
-        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}: {label.lower()} of each forecast",
+        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label.lower()} of each forecast",
                      f"{label} ({unit(transform)})" if name != "ape" else label,
                      os.path.join(output_dir, f"heatmap_{name}_by_cutoff.png"), diverging=diverging)
     for name, table in per_year.items():
         label, diverging = HEATMAPS_PER_YEAR[name]
-        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}: {label} over the cut-offs of each year",
+        plot_heatmap(table, f"Chronos2 zero-shot, {unit(transform)}, {window_label()}:\n{label} over the cut-offs of each year",
                      f"{label} ({unit(transform)})" if name != "MAPE" else label,
                      os.path.join(output_dir, f"heatmap_{name}_by_year.png"), diverging=diverging, annotate=True)
     plot_hair_chart(results, series, transform, os.path.join(output_dir, "hair_chart.png"))
