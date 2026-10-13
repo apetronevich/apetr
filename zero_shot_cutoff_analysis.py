@@ -14,9 +14,13 @@
 #      - BMPE_FILE : export excel du BMPE de juin 2026 (colonne DATE + TARGET_COLUMN)
 #      - LAST_OBSERVED : dernier trimestre observé du BMPE ; les trimestres suivants sont
 #        des projections et sont exclus (ni contexte, ni réalisé)
+#      - LAST_FINAL : dernier trimestre dont la valeur est définitive. Les trimestres
+#        suivants (encore révisés) servent de contexte mais pas de réalisé : les
+#        prévisions qui les visent ne sont pas évaluées
 #      - WINDOW_QUARTERS : None = fenêtre glissante croissante (expanding), 40 = 10 ans glissants
 #    Outputs (OUTPUT_DIR/<expanding|rolling40>/<level|qoq>) :
-#      - zero_shot_cutoff.xlsx : prévisions, erreurs coupure x horizon, métriques
+#      - zero_shot_cutoff.xlsx : prévisions, erreurs coupure x horizon, métriques,
+#        avec une ligne "Average" par horizon
 #      - heatmap_<métrique>.png : coupure en vertical, horizon en horizontal
 #      - hair_chart.png : réalisé + une prévision ("cheveu") par date de coupure
 #                         -----
@@ -32,9 +36,13 @@ BMPE_FILE = "Inputs/BMPE_Juin2026.xlsx"
 BMPE_SHEET = 0                  # sheet name or index
 DATE_COLUMN = "DATE"            # dates or quarters like "2000Q1"
 TARGET_COLUMN = "P51_S11S12S14A_7CH"   # matched ignoring case
-LAST_OBSERVED = "2026-01-01"    # 2026Q1 ; None = keep every non-empty row
+LAST_OBSERVED = "2026Q1"        # None = keep every non-empty row
+# Quarters after LAST_FINAL are still being revised: they stay in the model's history
+# (a forecaster would have had them) but are not used as ground truth. None = score
+# every quarter up to LAST_OBSERVED.
+LAST_FINAL = "2022Q4"
 
-FIRST_CUTOFF = "2000-01-01"     # 2000Q1, last quarter in the context of the first forecast
+FIRST_CUTOFF = "2000Q1"         # last quarter in the context of the first forecast
 # None: expanding window (all history up to the cut-off). 40: rolling window of the last
 # 10 years. Cut-offs with fewer than WINDOW_QUARTERS quarters of history are skipped,
 # so with a rolling window every forecast sees exactly the same amount of data.
@@ -96,9 +104,13 @@ def load_ground_truth():
         "level": pd.to_numeric(raw[find_column(raw, TARGET_COLUMN)], errors="coerce"),
     }).dropna().sort_values("DATE")
     if LAST_OBSERVED is not None:
-        data = data[data["DATE"] <= pd.Timestamp(LAST_OBSERVED)]
+        data = data[data["DATE"].dt.to_period("Q") <= quarter(LAST_OBSERVED)]
     data["qoq"] = 100 * data["level"].pct_change()
     return data.reset_index(drop=True)
+
+
+def quarter(value):
+    return pd.Period(value, freq="Q")
 
 
 def quarter_label(date):
@@ -123,7 +135,7 @@ def run_forecasts(pipeline, series):
     """Zero-shot forecasts from every cut-off, expanding or rolling window. series has
     DATE and TARGET_COLUMN, one row per quarter."""
     last = len(series) - 1
-    cutoffs = series.index[(series["DATE"] >= pd.Timestamp(FIRST_CUTOFF)) & (series.index < last)]
+    cutoffs = series.index[(series["DATE"].dt.to_period("Q") >= quarter(FIRST_CUTOFF)) & (series.index < last)]
     if WINDOW_QUARTERS is not None:
         too_short = cutoffs[cutoffs + 1 < WINDOW_QUARTERS]
         cutoffs = cutoffs[cutoffs + 1 >= WINDOW_QUARTERS]
@@ -163,7 +175,11 @@ def run_forecasts(pipeline, series):
     pred["cutoff"] = pd.to_datetime(pred["item_id"])
     pred["target_date"] = series["DATE"].reindex(truth_pos).to_numpy()
     pred["target_date"] = pred["target_date"].fillna(pd.to_datetime(pred["DATE"]))    # beyond LAST_OBSERVED
-    pred["actual"] = np.where(truth_pos <= last, target[np.minimum(truth_pos, last)], np.nan)
+    pred["bmpe_value"] = np.where(truth_pos <= last, target[np.minimum(truth_pos, last)], np.nan)
+    pred["actual"] = pred["bmpe_value"]
+    if LAST_FINAL is not None:
+        # still being revised: not a ground truth yet
+        pred.loc[pred["target_date"].dt.to_period("Q") > quarter(LAST_FINAL), "actual"] = np.nan
     pred["last_observed"] = target[cutoff_pos]    # no-change benchmark
 
     pred["error"] = pred["predictions"] - pred["actual"]
@@ -181,14 +197,22 @@ def evaluate(results, transform):
         # a percentage of a growth rate close to zero is meaningless
         scored = scored.assign(ape=100 * scored["abs_error"] / scored["actual"].abs())
 
+    # Last row "Average": mean over every scored forecast at that horizon, so it equals
+    # the MAFE / bias / MAPE of the by_horizon table (and the RMSE once square-rooted)
+    def with_average(table, value):
+        table.loc["Average"] = scored.groupby("horizon")[value].mean()
+        return table
+
     def by_cutoff(value):
         table = scored.pivot_table(index="cutoff", columns="horizon", values=value)
         table.index = [quarter_label(d) for d in table.index]
-        return table
+        return with_average(table, value)
 
-    def by_year(value, how="mean"):
-        return scored.assign(year=scored["cutoff"].dt.year).pivot_table(
-            index="year", columns="horizon", values=value, aggfunc=how)
+    def by_year(value):
+        table = scored.assign(year=scored["cutoff"].dt.year).pivot_table(
+            index="year", columns="horizon", values=value)
+        table.index = table.index.astype(str)
+        return with_average(table, value)
 
     def summary(frame):
         out = {"MAFE": frame["abs_error"].mean(),
@@ -219,7 +243,7 @@ def plot_heatmap(table, title, colorbar_label, path, diverging=False, annotate=F
         vmin, vmax, cmap = -limit, limit, plt.get_cmap("RdBu_r").copy()
     else:
         vmin, vmax, cmap = 0, np.percentile(finite, ROBUST_PERCENTILE), plt.get_cmap("Blues").copy()
-    cmap.set_bad("#e6e6e6")    # horizons beyond the last observed quarter
+    cmap.set_bad("#e6e6e6")    # targets after LAST_FINAL: no ground truth
 
     n_rows = len(table)
     row_height = 0.11 if n_rows > 40 else 0.3
@@ -228,20 +252,25 @@ def plot_heatmap(table, title, colorbar_label, path, diverging=False, annotate=F
                    aspect="auto", interpolation="nearest")
     ax.set_xticks(range(table.shape[1]), table.columns)
     step = 4 if n_rows > 40 else 1
-    ax.set_yticks(range(0, n_rows, step), table.index[::step])
+    ticks = list(range(0, n_rows - 1, step)) + [n_rows - 1]    # always label the Average row
+    ax.set_yticks(ticks, table.index[ticks])
+    has_average = table.index[-1] == "Average"
+    if has_average:
+        ax.axhline(n_rows - 1.5, color="white", linewidth=3)
     ax.set_xlabel("Forecast horizon (quarters)")
     ax.set_ylabel("Forecast cut-off")
     ax.set_title(title)
 
-    if annotate:
-        decimals = 0 if np.nanmax(np.abs(finite)) >= 100 else 2
-        for i in range(values.shape[0]):
-            for j in range(values.shape[1]):
-                v = values[i, j]
-                if np.isfinite(v):
-                    dark = abs(v) > 0.6 * vmax if diverging else v > 0.6 * vmax
-                    ax.text(j, i, f"{v:,.{decimals}f}", ha="center", va="center", fontsize=6.5,
-                            color="white" if dark else "#1f1f1f")
+    decimals = 0 if np.nanmax(np.abs(finite)) >= 100 else 2
+    annotated_rows = range(values.shape[0]) if annotate else ([n_rows - 1] if has_average else [])
+    for i in annotated_rows:
+        for j in range(values.shape[1]):
+            v = values[i, j]
+            if np.isfinite(v):
+                dark = abs(v) > 0.6 * vmax if diverging else v > 0.6 * vmax
+                ax.text(j, i, f"{v:,.{decimals}f}", ha="center", va="center", fontsize=6.5,
+                        color="white" if dark else "#1f1f1f",
+                        fontweight="bold" if i == n_rows - 1 and has_average else "normal")
 
     extend = "both" if diverging else "max"
     fig.colorbar(im, ax=ax, label=colorbar_label, extend=extend, shrink=0.6 if n_rows > 40 else 1.0)
@@ -259,9 +288,13 @@ def plot_hair_chart(results, series, transform, path):
         ax.plot(x, y, color="#2a6fdb", alpha=0.5, linewidth=1)
     ax.plot([], [], color="#2a6fdb", linewidth=1, label="Chronos2 median forecast, one per cut-off")
 
-    start = pd.Timestamp(FIRST_CUTOFF) - pd.DateOffset(years=2)
+    start = quarter(FIRST_CUTOFF).start_time - pd.DateOffset(years=2)
     shown = series[series["DATE"] >= start]
     ax.plot(shown["DATE"], shown[TARGET_COLUMN], color="#1f1f1f", linewidth=2, label="Realised (BMPE)")
+    provisional = series["DATE"][series["DATE"].dt.to_period("Q") > quarter(LAST_FINAL)] if LAST_FINAL else []
+    if len(provisional):
+        ax.axvspan(provisional.min(), results["target_date"].max(), color="#d9d9d9", alpha=0.5, linewidth=0,
+                   label=f"Not final yet (from {quarter_label(provisional.min())}): not scored")
 
     # Keep the bulk readable when a few quarters (e.g. Covid) are extreme. The range comes
     # from the realised series only: forecasts cluster near the mean and would shrink it.
