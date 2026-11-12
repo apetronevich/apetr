@@ -19,7 +19,11 @@
 #    Outputs (OUTPUT_DIR/<level|qoq>) :
 #      - lora_vs_zeroshot.xlsx : métriques par horizon, ratio LoRA / zero-shot par année,
 #        historique d'entraînement, prévisions
+#        + test de Diebold-Mariano LoRA vs zero-shot par horizon (feuille DM_test)
 #      - mafe_by_horizon.png, relative_mafe_by_year.png
+#    Outputs (OUTPUT_DIR) : si les deux transformations sont lancées,
+#      - level_comparison.xlsx / .png : niveaux prévus directement, ou reconstruits à partir
+#        des taux de croissance prévus, zero-shot et LoRA, sur les mêmes coupures
 #      - checkpoints/ : un adaptateur LoRA par date de ré-estimation
 #                         -----
 #  A.Petronevich et AI
@@ -300,6 +304,82 @@ def evaluate(results):
     return by_horizon, relative_by_year
 
 
+def diebold_mariano(loss_a, loss_b, horizon):
+    """Diebold-Mariano test of equal accuracy on loss_a - loss_b, ordered by cut-off.
+    h-step forecasts made in consecutive quarters overlap, so their errors are correlated
+    up to lag h-1: Newey-West variance with h-1 lags (Bartlett weights) and the
+    Harvey-Leybourne-Newbold small-sample correction. A negative statistic means model a
+    is more accurate. Returns (statistic, two-sided p-value).
+    With about 100 cut-offs the test rejects too often beyond h = 1: in simulations of
+    equally accurate overlapping forecasts, about 10% rejections at the 5% level for
+    h = 4 to 12 (4% for h = 1). Read p < 0.01 as clear evidence, 0.01-0.10 as weak."""
+    d = np.asarray(loss_a, dtype=float) - np.asarray(loss_b, dtype=float)
+    n = len(d)
+    if n < 10:
+        return np.nan, np.nan
+    dc = d - d.mean()
+    variance = dc @ dc / n
+    for k in range(1, horizon):
+        variance += 2 * (1 - k / horizon) * (dc[k:] @ dc[:-k]) / n
+    if variance <= 0:
+        return np.nan, np.nan
+    stat = d.mean() / np.sqrt(variance / n)
+    stat *= np.sqrt((n + 1 - 2 * horizon + horizon * (horizon - 1) / n) / n)
+    try:
+        from scipy.stats import t
+        p_value = 2 * t.sf(abs(stat), df=n - 1)
+    except ImportError:    # normal approximation, close to Student's t for n around 100
+        from math import erf, sqrt
+        p_value = 2 * (1 - 0.5 * (1 + erf(abs(stat) / sqrt(2))))
+    return stat, p_value
+
+
+def dm_table(scored, model_a, model_b, actual):
+    """DM tests of model_a against model_b by horizon, on absolute and squared errors."""
+    rows = {}
+    for h, g in scored.sort_values("cutoff").groupby("horizon"):
+        e_a, e_b = g[model_a] - g[actual], g[model_b] - g[actual]
+        dm_abs, p_abs = diebold_mariano(e_a.abs(), e_b.abs(), h)
+        dm_sq, p_sq = diebold_mariano(e_a ** 2, e_b ** 2, h)
+        rows[h] = {"DM stat, absolute errors": dm_abs, "p-value, absolute errors": p_abs,
+                   "DM stat, squared errors": dm_sq, "p-value, squared errors": p_sq, "N": len(g)}
+    table = pd.DataFrame(rows).T
+    table.index.name = "horizon"
+    return table
+
+
+def implied_levels(results, levels):
+    """Level paths implied by the growth forecasts: level at the cut-off compounded by the
+    forecast q-o-q growth rates up to each horizon. Ground truth: the realised level,
+    final quarters only, as for the other scores."""
+    level_at = levels.set_index("DATE")[TARGET_COLUMN]
+    out = results.sort_values(["cutoff", "horizon"]).copy()
+    base = out["cutoff"].map(level_at).to_numpy()
+    for model in ["zero_shot", "lora"]:
+        growth = 1 + out[model] / 100
+        out[model] = base * growth.groupby(out["cutoff"]).cumprod().to_numpy()
+    out["actual"] = np.where(out["actual"].notna(), out["target_date"].map(level_at), np.nan)
+    return out
+
+
+def compare_levels(level_results, implied):
+    """MAFE / RMSE of the four ways of forecasting the level, on the cut-offs and horizons
+    where all four are scored, and DM tests of each against direct zero-shot."""
+    keys = ["cutoff", "horizon"]
+    merged = level_results[keys + ["zero_shot", "lora", "actual"]].merge(
+        implied[keys + ["zero_shot", "lora"]].rename(columns={"zero_shot": "growth_zero_shot", "lora": "growth_lora"}),
+        on=keys).dropna(subset=["actual"])
+    models = {"zero_shot": "Level, zero-shot", "lora": "Level, LoRA",
+              "growth_zero_shot": "From growth, zero-shot", "growth_lora": "From growth, LoRA"}
+    mafe = pd.DataFrame({label: (merged[m] - merged["actual"]).abs().groupby(merged["horizon"]).mean()
+                         for m, label in models.items()})
+    rmse = pd.DataFrame({label: np.sqrt(((merged[m] - merged["actual"]) ** 2).groupby(merged["horizon"]).mean())
+                         for m, label in models.items()})
+    dm = {label: dm_table(merged, m, "zero_shot", "actual")
+          for m, label in models.items() if m != "zero_shot"}
+    return mafe, rmse, dm
+
+
 ################## Plot #####################################
 
 def plot_by_horizon(by_horizon, transform, path):
@@ -354,9 +434,27 @@ def plot_relative_by_year(table, transform, path):
     plt.close(fig)
 
 
+def plot_level_comparison(mafe, path):
+    styles = {"Level, zero-shot": ("#8c8c8c", "-"), "Level, LoRA": ("#0b3d91", "-"),
+              "From growth, zero-shot": ("#8c8c8c", "--"), "From growth, LoRA": ("#0b3d91", "--")}
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for label, (color, style) in styles.items():
+        ax.plot(mafe.index, mafe[label], color=color, linestyle=style, marker="o", markersize=4, linewidth=2,
+                label=label)
+    ax.set_xlabel("Forecast horizon (quarters)")
+    ax.set_ylabel("MAFE on the level")
+    ax.set_xticks(mafe.index)
+    ax.set_title(f"{TARGET_COLUMN}: level forecast directly, or rebuilt from growth forecasts")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 ################## Save #####################################
 
-def save_excel(path, by_horizon, relative_by_year, training, results):
+def save_excel(path, by_horizon, relative_by_year, dm, training, results):
     settings = pd.DataFrame({"setting": ["TRAIN_SERIES", "REFIT_EVERY", "LORA_CONFIG", "LEARNING_RATE", "NUM_STEPS",
                                          "BATCH_SIZE", "USE_VALIDATION", "SEED", "LAST_FINAL"],
                              "value": [str(v) for v in [TRAIN_SERIES, REFIT_EVERY, LORA_CONFIG, LEARNING_RATE, NUM_STEPS,
@@ -364,6 +462,7 @@ def save_excel(path, by_horizon, relative_by_year, training, results):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         by_horizon.to_excel(writer, sheet_name="by_horizon")
         relative_by_year.to_excel(writer, sheet_name="MAFE_ratio_by_year")
+        dm.to_excel(writer, sheet_name="DM_test")
         training.to_excel(writer, sheet_name="training", index=False)
         settings.to_excel(writer, sheet_name="settings", index=False)
         results.to_excel(writer, sheet_name="forecasts", index=False)
@@ -391,19 +490,48 @@ def main(pipeline=None):
     data = load_bmpe()
     print(f"  {len(data)} quarters, {len(data.columns) - 1} series for fine-tuning ({TRAIN_SERIES})", flush=True)
 
+    all_results = {}
     for transform in TRANSFORMS:
         print(f"\nStep 3 - {TARGET_COLUMN}, {unit(transform)}: zero-shot and LoRA forecasts", flush=True)
         output_dir = os.path.join(OUTPUT_DIR, transform)
         os.makedirs(output_dir, exist_ok=True)
         results, training = run(pipeline, transform_panel(data, transform), transform)
+        all_results[transform] = results
         by_horizon, relative_by_year = evaluate(results)
+        dm = dm_table(results.dropna(subset=["actual"]), "lora", "zero_shot", "actual")
 
         print("\n  Scored on final quarters (up to %s):" % LAST_FINAL)
         print(by_horizon.round(3).to_string())
+        print("\n  Diebold-Mariano, LoRA vs zero-shot (negative: LoRA more accurate; beyond h = 1 the test "
+              "rejects too often with ~100 cut-offs, so read p < 0.01 as clear, 0.01-0.10 as weak):")
+        print(dm.round(3).to_string())
         save_excel_unlocked(os.path.join(output_dir, "lora_vs_zeroshot.xlsx"),
-                            by_horizon, relative_by_year, training, results)
+                            by_horizon, relative_by_year, dm, training, results)
         plot_by_horizon(by_horizon, transform, os.path.join(output_dir, "mafe_by_horizon.png"))
         plot_relative_by_year(relative_by_year, transform, os.path.join(output_dir, "relative_mafe_by_year.png"))
+
+    if {"level", "qoq"} <= set(all_results):
+        print(f"\nStep 4 - {TARGET_COLUMN} level: forecast directly, or rebuilt from the growth forecasts", flush=True)
+        implied = implied_levels(all_results["qoq"], data[["DATE", TARGET_COLUMN]])
+        mafe, rmse, dm = compare_levels(all_results["level"], implied)
+        print("\n  MAFE on the level, same cut-offs and horizons for all four:")
+        print(mafe.round(0).to_string())
+        path = os.path.join(OUTPUT_DIR, "level_comparison.xlsx")
+        try:
+            writer = pd.ExcelWriter(path, engine="openpyxl")
+        except PermissionError:
+            path = path.replace(".xlsx", f"_{pd.Timestamp.now():%Y%m%d_%H%M%S}.xlsx")
+            writer = pd.ExcelWriter(path, engine="openpyxl")
+        with writer:
+            mafe.to_excel(writer, sheet_name="MAFE")
+            rmse.to_excel(writer, sheet_name="RMSE")
+            for i, (label, table) in enumerate(dm.items()):
+                sheet = f"DM_{i + 1}"
+                table.to_excel(writer, sheet_name=sheet, startrow=1)
+                writer.sheets[sheet].cell(row=1, column=1, value=f"{label} vs Level, zero-shot (negative: more accurate)")
+            implied.to_excel(writer, sheet_name="implied_levels", index=False)
+        print(f"  Saved {path}")
+        plot_level_comparison(mafe, os.path.join(OUTPUT_DIR, "level_comparison.png"))
 
 
 if __name__ == "__main__":
