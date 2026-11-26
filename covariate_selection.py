@@ -77,12 +77,14 @@ TRANSFORMS = ["level", "qoq", "qoq_cov"]
 # "diff" = first difference, "none" = unchanged. Covariates not listed follow the rule:
 # dummies unchanged; logs (names starting with L_) and series with zero or negative
 # values -> "diff"; otherwise "growth". Rates are differenced (a % change of a rate near
-# zero is meaningless); error-correction gaps enter an ECM in level. To be checked.
+# zero is meaningless); error-correction gaps enter an ECM in level.
 COVARIATE_TRANSFORM_OVERRIDES = {
     "fr_ltn": "diff", "fr_ltn_2y": "diff", "fr_ltn_3y": "diff", "fr_ltn_5y": "diff",
-    "TEURIBOR": "diff", "HTL_CKR": "diff",
-    "VP_D_ECART_L_B1_SM_7CH": "none", "VP_D_ECART_L_CKR_S11S12S14A": "none",
-    "VP_DHTL_B1_SM_7CH": "none", "VP_DHTL_CKR": "none",
+    "TEURIBOR": "diff", "HTL_CKR": "diff",                       # rates
+    "DFHP51S11S12S14A_7CH": "growth", "HTL_B1_SM_7CH": "growth",  # levels
+    "HTL_DF_HP51_7CH": "growth",
+    "VP_D_ECART_L_B1_SM_7CH": "none", "VP_D_ECART_L_CKR_S11S12S14A": "none",   # gaps
+    "VP_DHTL_B1_SM_7CH": "none", "VP_DHTL_CKR": "none",          # already first differences
 }
 QUANTILE_LEVELS = [0.1, 0.5, 0.9]
 
