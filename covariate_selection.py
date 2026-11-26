@@ -7,7 +7,11 @@
 #      - the projection assumptions (HYPOTHESES) are known over the forecast horizon: their
 #        future values are given to the model (future_df);
 #      - the investment-equation variables (EQUATION) are past-only;
-#      - the Covid dummies (DUMMIES) are calendar variables, known over the horizon.
+#      - the Covid dummies (DUMMIES) are past-only: before 2020 nobody knew a shock was
+#        coming, so giving their future values would announce Covid in advance.
+#    Three runs: target in level; target in q-o-q growth with the covariates as they are
+#    ("qoq"); target in q-o-q growth with the covariates transformed too ("qoq_cov": growth
+#    rates, differences or unchanged, see COVARIATE_TRANSFORM_OVERRIDES).
 #    Choosing the covariates on the whole sample and then reporting their score would be
 #    look-ahead. The sample is split:
 #      - selection period (cut-offs up to SELECTION_END, errors observable by then):
@@ -23,7 +27,7 @@
 #
 #    Inputs:
 #      - MODEL_PATH ; INPUT_FILE (colonne DATE, la cible et les covariables)
-#    Outputs (OUTPUT_DIR/<level|qoq>) :
+#    Outputs (OUTPUT_DIR/<level|qoq|qoq_cov>) :
 #      - covariate_selection.xlsx : ensembles testés, sélection pas à pas, scores sur la
 #        période de sélection et d'évaluation, tests de Diebold-Mariano, prévisions
 #      - mafe_ratio_evaluation.png, mafe_ratio_selection.png
@@ -56,17 +60,30 @@ HYPOTHESES = {
     "USDEXR": ["USDEXR"],
 }
 # Variables of the investment equation: past-only
-EQUATION = ["C_DFHP51S11S12S14A_7CH_P51_S11S12S14A_7CH_GRQ", "C_HTL_B1_SM_7CH_P51_S11S12S14A_7CH_GRQ",
-            "C_HTL_CKR_P51_S11S12S14A_7CH_GRQ", "HTL_DF_HP51_7CH", "L_C_P51_S11S12S14A_7CH",
+EQUATION = ["DFHP51S11S12S14A_7CH", "HTL_B1_SM_7CH",
+            "HTL_CKR", "HTL_DF_HP51_7CH", "L_C_P51_S11S12S14A_7CH",
             "VP_D_ECART_L_B1_SM_7CH", "VP_D_ECART_L_CKR_S11S12S14A", "VP_DHTL_B1_SM_7CH", "VP_DHTL_CKR"]
-# Calendar dummies: known over the forecast horizon
+# Covid dummies: past-only (their future values were not known before 2020)
 DUMMIES = ["DU20Q1", "DU20Q2", "DU20Q3"]
 
 FIRST_CUTOFF = "2000Q1"
 MIN_CONTEXT = 20                # quarters of history required at a cut-off (the file starts in 1999)
 SELECTION_END = "2012Q4"        # last cut-off (and last observed quarter) of the selection period
 PREDICTION_LENGTH = 12
-TRANSFORMS = ["level", "qoq"]   # target in level / in q-o-q growth; covariates are left as they are
+# "level": target in level, covariates as they are. "qoq": target in q-o-q growth,
+# covariates as they are. "qoq_cov": target in q-o-q growth, covariates transformed too.
+TRANSFORMS = ["level", "qoq", "qoq_cov"]
+# How each covariate is transformed in the "qoq_cov" run: "growth" = q-o-q % change,
+# "diff" = first difference, "none" = unchanged. Covariates not listed follow the rule:
+# dummies unchanged; logs (names starting with L_) and series with zero or negative
+# values -> "diff"; otherwise "growth". Rates are differenced (a % change of a rate near
+# zero is meaningless); error-correction gaps enter an ECM in level. To be checked.
+COVARIATE_TRANSFORM_OVERRIDES = {
+    "fr_ltn": "diff", "fr_ltn_2y": "diff", "fr_ltn_3y": "diff", "fr_ltn_5y": "diff",
+    "TEURIBOR": "diff", "HTL_CKR": "diff",
+    "VP_D_ECART_L_B1_SM_7CH": "none", "VP_D_ECART_L_CKR_S11S12S14A": "none",
+    "VP_DHTL_B1_SM_7CH": "none", "VP_DHTL_CKR": "none",
+}
 QUANTILE_LEVELS = [0.1, 0.5, 0.9]
 
 MIN_IMPROVEMENT = 0.01          # forward selection: a group must lower the average MAFE ratio by 1%
@@ -116,7 +133,37 @@ def quarter_label(date):
 
 
 def unit(transform):
-    return "q-o-q growth, %" if transform == "qoq" else "level"
+    return {"level": "level", "qoq": "q-o-q growth, %, covariates as they are",
+            "qoq_cov": "q-o-q growth, %, covariates transformed"}[transform]
+
+
+def covariate_transform_rules(data):
+    """Transformation of each covariate in the qoq_cov run."""
+    rules = {}
+    for c in data.columns:
+        if c in ("DATE", TARGET_COLUMN):
+            continue
+        if c in COVARIATE_TRANSFORM_OVERRIDES:
+            rules[c] = COVARIATE_TRANSFORM_OVERRIDES[c]
+        elif c in DUMMIES:
+            rules[c] = "none"
+        elif c.upper().startswith("L_") or (data[c].dropna() <= 0).any():
+            rules[c] = "diff"
+        else:
+            rules[c] = "growth"
+    return rules
+
+
+def transform_covariates(data, rules):
+    """Applied to the whole file, so the future values continue the past ones (the first
+    future growth rate uses the last observed value)."""
+    out = data.copy()
+    for c, rule in rules.items():
+        if rule == "growth":
+            out[c] = 100 * data[c].pct_change()
+        elif rule == "diff":
+            out[c] = data[c].diff() * (100 if c.upper().startswith("L_") else 1)
+    return out.replace([np.inf, -np.inf], np.nan)
 
 
 def load_data():
@@ -148,7 +195,7 @@ def covariate_groups(data):
     present = set(data.columns)
     groups = {name: ([], [c for c in cols if c in present]) for name, cols in HYPOTHESES.items()}
     groups["equation"] = ([c for c in EQUATION if c in present], [])
-    groups["dummies"] = ([], [c for c in DUMMIES if c in present])
+    groups["dummies"] = ([c for c in DUMMIES if c in present], [])
     return {name: g for name, g in groups.items() if g[0] or g[1]}
 
 
@@ -203,9 +250,12 @@ class Experiment:
     """Runs and caches the forecasts of each covariate set for one target transformation."""
 
     def __init__(self, pipeline, data, transform):
+        self.rules = covariate_transform_rules(data) if transform == "qoq_cov" else {}
+        if self.rules:
+            data = transform_covariates(data, self.rules)
         self.pipeline, self.full, self.transform = pipeline, data, transform
         observed = data[data["DATE"].dt.to_period("Q") <= quarter(LAST_OBSERVED)].copy()
-        if transform == "qoq":
+        if transform in ("qoq", "qoq_cov"):
             observed[TARGET_COLUMN] = 100 * observed[TARGET_COLUMN].pct_change()
         self.series = observed.dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
         last = len(self.series) - 1
@@ -425,9 +475,12 @@ def plot_ratio_heatmap(table, title, path):
 
 ################## Save #####################################
 
-def save_excel(path, summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts):
+def save_excel(path, summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, rules):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
+        if rules:
+            pd.Series(rules, name="transformation").rename_axis("covariate").to_excel(
+                writer, sheet_name="covariate_transforms")
         definitions.to_excel(writer, sheet_name="sets", index=False)
         steps.to_excel(writer, sheet_name="forward_selection", index=False)
         mafe_eval.to_excel(writer, sheet_name="MAFE_ratio_evaluation")
@@ -464,6 +517,9 @@ def main(pipeline=None):
         output_dir = os.path.join(OUTPUT_DIR, transform)
         os.makedirs(output_dir, exist_ok=True)
         exp = Experiment(pipeline, data, transform)
+        if exp.rules:
+            by_rule = pd.Series(exp.rules).groupby(lambda c: exp.rules[c]).apply(lambda s: ", ".join(s.index))
+            print("  covariate transformations: " + "; ".join(f"{r}: {cols}" for r, cols in by_rule.items()), flush=True)
         cut = exp.series["DATE"]
         print(f"  cut-offs {quarter_label(cut.iloc[exp.cutoffs[0]])} to {quarter_label(cut.iloc[exp.cutoffs[-1]])}; "
               f"selection up to {SELECTION_END}, evaluation after; groups: {', '.join(exp.groups)}", flush=True)
@@ -478,7 +534,7 @@ def main(pipeline=None):
 
         forecasts = pd.concat([res.assign(set=set_name(list(k[0]), k[1])) for k, res in exp.cache.items()])
         save_excel_unlocked(os.path.join(output_dir, "covariate_selection.xlsx"),
-                            summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts)
+                            summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, exp.rules)
         plot_ratio_heatmap(mafe_eval, f"Evaluation period (cut-offs after {SELECTION_END})\nMAFE ratio to no "
                                       f"covariates, {unit(transform)}", os.path.join(output_dir, "mafe_ratio_evaluation.png"))
         plot_ratio_heatmap(mafe_sel, f"Selection period (up to {SELECTION_END})\nMAFE ratio to no covariates, "
