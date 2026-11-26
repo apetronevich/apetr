@@ -12,7 +12,7 @@
 #    SETS_TO_PLOT : "none" (pas de covariables), "selected" (choisi sur la période de
 #    sélection), "best" (meilleur sur la période d'évaluation : choisi a posteriori), ou le
 #    nom exact d'un ensemble (colonne "set" de la feuille summary, sans "[selected]").
-#    Outputs : OUTPUT_DIR/<run>/hair_charts_covariates.png
+#    Outputs : OUTPUT_DIR/<ASSUMPTIONS_MODE>/<run>/hair_charts_covariates.png
 #                         -----
 #  A.Petronevich et AI
 ############################################################################################
@@ -41,7 +41,7 @@ COVARIATE_COLOR = "#2a6fdb"
 #####################  Get the data  ######################################################
 
 def load_results(run):
-    path = os.path.join(cs.OUTPUT_DIR, run, "covariate_selection.xlsx")
+    path = os.path.join(cs.results_dir(run), "covariate_selection.xlsx")
     if not os.path.exists(path):
         return None, None
     forecasts = pd.read_excel(path, sheet_name="forecasts", parse_dates=["cutoff"])
@@ -153,7 +153,7 @@ def main():
             continue
         print(f"{cs.TARGET_COLUMN}, {cs.unit(run)}", flush=True)
         plot_run(run, forecasts, resolve_sets(summary), observed_series(run),
-                 os.path.join(cs.OUTPUT_DIR, run, "hair_charts_covariates.png"))
+                 os.path.join(cs.results_dir(run), "hair_charts_covariates.png"))
 
 
 if __name__ == "__main__":

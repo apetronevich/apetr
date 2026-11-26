@@ -4,8 +4,12 @@
 #                         -----
 #    Expanding-window zero-shot forecasts of TARGET_COLUMN, 1..PREDICTION_LENGTH quarters
 #    ahead, from every cut-off, with different sets of covariates:
-#      - the projection assumptions (HYPOTHESES) are known over the forecast horizon: their
-#        future values are given to the model (future_df);
+#      - the projection assumptions (HYPOTHESES) get values over the forecast horizon
+#        (future_df), set by ASSUMPTIONS_MODE: "forecast" = Chronos2's own zero-shot forecast
+#        of each assumption from its history up to the cut-off (only information available
+#        at the cut-off); "realised" = the values that actually happened (a forecast
+#        conditional on perfect foresight of the assumptions: an upper bound); "past" =
+#        no future values (past-only covariates);
 #      - the investment-equation variables (EQUATION) are past-only;
 #      - the Covid dummies (DUMMIES) are past-only: before 2020 nobody knew a shock was
 #        coming, so giving their future values would announce Covid in advance.
@@ -20,16 +24,15 @@
 #      - evaluation period (cut-offs after SELECTION_END, final quarters up to LAST_FINAL):
 #        the selected set and fixed reference sets are scored out of sample against the
 #        forecast without covariates (MAFE ratio, RMSE ratio, Diebold-Mariano test).
-#    Caveat: the future values of the assumptions in the file are the realised ones, not
-#    the assumptions available at each cut-off: with them the forecast is conditional on
-#    a perfect foresight of the assumptions (an upper bound). The past-only run of the
-#    same assumptions shows how much of the gain comes from that.
+#    The selected set and all assumptions together are also scored in the two other modes,
+#    to compare forecast, realised and past-only assumptions.
 #
 #    Inputs:
 #      - MODEL_PATH ; INPUT_FILE (colonne DATE, la cible et les covariables)
-#    Outputs (OUTPUT_DIR/<level|qoq|qoq_cov>) :
+#    Outputs (OUTPUT_DIR/<ASSUMPTIONS_MODE>/<level|qoq|qoq_cov>) :
 #      - covariate_selection.xlsx : ensembles testés, sélection pas à pas, scores sur la
-#        période de sélection et d'évaluation, tests de Diebold-Mariano, prévisions
+#        période de sélection et d'évaluation, tests de Diebold-Mariano, prévisions,
+#        prévisions des hypothèses (mode "forecast")
 #      - mafe_ratio_evaluation.png, mafe_ratio_selection.png
 #                         -----
 #  A.Petronevich et AI
@@ -47,8 +50,7 @@ TARGET_COLUMN = "P51_S11S12S14A_7CH"
 LAST_OBSERVED = "2026Q1"        # last quarter of the target used (context and ground truth)
 LAST_FINAL = "2022Q4"           # later quarters are still revised: not used as ground truth
 
-# Projection assumptions, known over the forecast horizon, by group (one group = one block
-# that forward selection can add)
+# Projection assumptions, by group (one group = one block that forward selection can add)
 HYPOTHESES = {
     "fr_cmd": ["fr_cmd", "fr_cmdex", "fr_cmdin"],
     "fr_cxd": ["fr_cxd", "fr_cxdex", "fr_cxdin"],
@@ -65,6 +67,12 @@ EQUATION = ["DFHP51S11S12S14A_7CH", "HTL_B1_SM_7CH",
             "VP_D_ECART_L_B1_SM_7CH", "VP_D_ECART_L_CKR_S11S12S14A", "VP_DHTL_B1_SM_7CH", "VP_DHTL_CKR"]
 # Covid dummies: past-only (their future values were not known before 2020)
 DUMMIES = ["DU20Q1", "DU20Q2", "DU20Q3"]
+
+# Values of the assumptions over the forecast horizon in the selection and the main
+# comparison: "forecast" (Chronos2 zero-shot forecast of each assumption made at the
+# cut-off: real-time feasible), "realised" (actual values: conditional on perfect
+# foresight) or "past" (no future values)
+ASSUMPTIONS_MODE = "forecast"
 
 FIRST_CUTOFF = "2000Q1"
 MIN_CONTEXT = 20                # quarters of history required at a cut-off (the file starts in 1999)
@@ -201,6 +209,10 @@ def covariate_groups(data):
     return {name: g for name, g in groups.items() if g[0] or g[1]}
 
 
+def results_dir(run):
+    return os.path.join(OUTPUT_DIR, ASSUMPTIONS_MODE, run)
+
+
 ################## Generate predictions ####################
 
 def future_timestamps(contexts):
@@ -216,10 +228,38 @@ def future_timestamps(contexts):
                              "DATE": [d + k * offset for d in last for k in range(1, PREDICTION_LENGTH + 1)]})
 
 
-def forecast(pipeline, series, full, past_cols, future_cols, cutoffs):
+def forecast_assumptions(pipeline, full, cutoff_dates, columns):
+    """Zero-shot forecast of each assumption from its own history up to each cut-off
+    (univariate, expanding window). Returns one row per (cut-off, future quarter) with
+    one column per assumption."""
+    quarters = full["DATE"].dt.to_period("Q")
+    contexts = []
+    for c in columns:
+        for d in cutoff_dates:
+            hist = full.loc[quarters <= d.to_period("Q"), ["DATE", c]]
+            first = hist[c].first_valid_index()
+            if first is None:
+                continue    # no history yet: the future values stay missing
+            contexts.append(hist.loc[first:].rename(columns={c: "value"}).assign(item_id=f"{c}|{d:%Y-%m-%d}"))
+    pred = pipeline.predict_df(
+        pd.concat(contexts, ignore_index=True),
+        future_df=None,
+        prediction_length=PREDICTION_LENGTH,
+        quantile_levels=[0.5],
+        id_column="item_id",
+        timestamp_column="DATE",
+        target="value",
+    )
+    pred[["column", "item_id"]] = pred["item_id"].str.split("|", n=1, expand=True)
+    pred["q"] = pd.to_datetime(pred["DATE"]).dt.to_period("Q")
+    return pred.pivot_table(index=["item_id", "q"], columns="column", values="predictions").reset_index()
+
+
+def forecast(pipeline, series, full, past_cols, future_cols, cutoffs, assumption_paths=None):
     """Forecasts from every cut-off: context = all quarters up to the cut-off (target and
-    covariates); future covariates = their values over the next PREDICTION_LENGTH quarters
-    (missing beyond the end of the file, which Chronos2 masks)."""
+    covariates); future covariates = their values over the next PREDICTION_LENGTH quarters:
+    the realised ones from the file (missing beyond its end, which Chronos2 masks), or,
+    with assumption_paths, the forecasts of the assumptions made at each cut-off."""
     columns = ["DATE", TARGET_COLUMN] + past_cols + future_cols
     contexts = pd.concat(
         [series.iloc[:pos + 1][columns].assign(item_id=series["DATE"].iloc[pos].strftime("%Y-%m-%d"))
@@ -229,10 +269,15 @@ def forecast(pipeline, series, full, past_cols, future_cols, cutoffs):
     future_df = None
     if future_cols:
         future_df = future_timestamps(contexts)
-        future_quarter = future_df["DATE"].dt.to_period("Q")
-        by_quarter = full.assign(q=full["DATE"].dt.to_period("Q")).drop_duplicates("q").set_index("q")
-        for c in future_cols:
-            future_df[c] = future_quarter.map(by_quarter[c]).to_numpy()
+        future_df["q"] = future_df["DATE"].dt.to_period("Q")
+        if assumption_paths is not None:
+            future_df = future_df.merge(assumption_paths[["item_id", "q"] + future_cols], on=["item_id", "q"],
+                                        how="left")
+        else:
+            by_quarter = full.assign(q=full["DATE"].dt.to_period("Q")).drop_duplicates("q").set_index("q")
+            for c in future_cols:
+                future_df[c] = future_df["q"].map(by_quarter[c]).to_numpy()
+        future_df = future_df.drop(columns="q")
     pred = pipeline.predict_df(
         contexts,
         future_df=future_df,
@@ -265,6 +310,7 @@ class Experiment:
         self.cutoffs = [pos for pos in range(MIN_CONTEXT - 1, last) if quarters.iloc[pos] >= quarter(FIRST_CUTOFF)]
         self.groups = covariate_groups(data)
         self.cache = {}
+        self.assumption_paths = None
         self.truth = self._truth()
 
     def _truth(self):
@@ -277,33 +323,54 @@ class Experiment:
         truth["actual"] = np.where(inside, self.series[TARGET_COLUMN].to_numpy()[pos], np.nan)
         return truth.drop(columns="pos")
 
-    def columns(self, names, hypotheses_future=True):
+    def columns(self, names, mode=None):
+        mode = mode or ASSUMPTIONS_MODE
         past, future = [], []
         for name in names:
             p, f = self.groups[name]
             past += p
-            if name in HYPOTHESES and not hypotheses_future:
+            if name in HYPOTHESES and mode == "past":
                 past += f
             else:
                 future += f
         return past, future
 
-    def run(self, names, hypotheses_future=True):
-        key = (tuple(sorted(names)), hypotheses_future)
+    def paths(self):
+        """Forecasts of all the assumptions at every cut-off, computed once."""
+        if self.assumption_paths is None:
+            columns = [c for g in self.groups if g in HYPOTHESES for c in self.groups[g][1]]
+            dates = [self.series["DATE"].iloc[pos] for pos in self.cutoffs]
+            print(f"  forecasting {len(columns)} assumption series at {len(dates)} cut-offs", flush=True)
+            self.assumption_paths = forecast_assumptions(self.pipeline, self.full, dates, columns)
+        return self.assumption_paths
+
+    def run(self, names, mode=None):
+        mode = mode_of(names, mode)
+        key = (tuple(sorted(names)), mode)
         if key not in self.cache:
-            past, future = self.columns(key[0], hypotheses_future)
-            pred = forecast(self.pipeline, self.series, self.full, past, future, self.cutoffs)
+            past, future = self.columns(key[0], mode)
+            paths = self.paths() if mode == "forecast" and future else None
+            pred = forecast(self.pipeline, self.series, self.full, past, future, self.cutoffs, paths)
             self.cache[key] = pred.merge(self.truth, on=["cutoff", "horizon"])
         return self.cache[key]
 
 
 ################## Forecast evaluation ######################
 
-def set_name(names, hypotheses_future=True):
+MODE_LABELS = {"forecast": "assumptions forecast", "realised": "assumptions realised", "past": "assumptions past-only"}
+
+
+def mode_of(names, mode=None):
+    """The assumptions mode only matters for sets containing assumptions."""
+    return (mode or ASSUMPTIONS_MODE) if any(n in HYPOTHESES for n in names) else "n/a"
+
+
+def set_name(names, mode=None):
     if not names:
         return "none"
+    mode = mode_of(names, mode)
     name = " + ".join(sorted(names))
-    return name if hypotheses_future or not any(n in HYPOTHESES for n in names) else name + " (assumptions past-only)"
+    return name if mode == "n/a" else f"{name} ({MODE_LABELS[mode]})"
 
 
 def sample(results, period):
@@ -398,29 +465,32 @@ def forward_selection(exp):
 
 
 def candidate_sets(exp, selected):
-    """Sets scored on the evaluation period: (names, hypotheses known in the future)."""
+    """Sets scored on the evaluation period: (names, assumptions mode). The selected set and
+    all the assumptions are also scored in the two other modes."""
     hyps = [g for g in exp.groups if g in HYPOTHESES]
-    sets = [([], True), (selected, True)]
+    other_modes = [m for m in MODE_LABELS if m != ASSUMPTIONS_MODE]
+    sets = [([], None), (selected, None)]
     if any(g in HYPOTHESES for g in selected):
-        sets.append((selected, False))
-    sets += [([g], True) for g in exp.groups]
+        sets += [(selected, m) for m in other_modes]
+    sets += [([g], None) for g in exp.groups]
     if hyps:
-        sets += [(hyps, True), (hyps, False)]
+        sets += [(hyps, None)] + [(hyps, m) for m in other_modes]
     if "equation" in exp.groups:
-        sets.append((["equation"] + (["dummies"] if "dummies" in exp.groups else []), True))
-    sets.append((list(exp.groups), True))
+        sets.append((["equation"] + (["dummies"] if "dummies" in exp.groups else []), None))
+    sets.append((list(exp.groups), None))
     unique = {}
-    for names, fut in sets:
-        unique.setdefault((tuple(sorted(names)), fut), (names, fut))
+    for names, mode in sets:
+        unique.setdefault((tuple(sorted(names)), mode_of(names, mode)), (names, mode))
     return list(unique.values())
 
 
 def score_sets(exp, sets, selected):
     baseline = exp.run([])
     rows, mafe_ratio, sel_ratio, dms, definitions = [], {}, {}, {}, []
-    for names, fut in sets:
-        res = exp.run(names, fut)
-        label = set_name(names, fut) + ("  [selected]" if sorted(names) == sorted(selected) and fut else "")
+    for names, mode in sets:
+        res = exp.run(names, mode)
+        is_selected = sorted(names) == sorted(selected) and mode_of(names, mode) == mode_of(selected)
+        label = set_name(names, mode) + ("  [selected]" if is_selected else "")
         ratio = mafe(res, "evaluation") / mafe(baseline, "evaluation")
         mafe_ratio[label] = ratio
         sel_ratio[label] = mafe(res, "selection") / mafe(baseline, "selection")
@@ -433,9 +503,11 @@ def score_sets(exp, sets, selected):
                      "average MAFE ratio, selection": sel_ratio[label].mean(),
                      "horizons better at 5% (DM)": int(((dm["DM stat"] < 0) & (dm["p-value"] < 0.05)).sum()),
                      "horizons worse at 5% (DM)": int(((dm["DM stat"] > 0) & (dm["p-value"] < 0.05)).sum())})
-        past, future = exp.columns(names, fut)
+        past, future = exp.columns(names, mode)
         definitions.append({"set": label, "past-only covariates": ", ".join(past),
-                            "known-future covariates": ", ".join(future)})
+                            "covariates with future values": ", ".join(future),
+                            "future values": {"forecast": "forecast at the cut-off", "realised": "realised",
+                                              "past": "", "n/a": ""}[mode_of(names, mode)] if future else ""})
     summary = pd.DataFrame(rows).sort_values("average MAFE ratio, evaluation").reset_index(drop=True)
     order = list(summary["set"])
     return (summary, pd.DataFrame(mafe_ratio).T.reindex(order), pd.DataFrame(sel_ratio).T.reindex(order),
@@ -477,7 +549,7 @@ def plot_ratio_heatmap(table, title, path):
 
 ################## Save #####################################
 
-def save_excel(path, summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, rules):
+def save_excel(path, summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, rules, paths):
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
         if rules:
@@ -489,6 +561,9 @@ def save_excel(path, summary, definitions, steps, mafe_eval, mafe_sel, dms, fore
         mafe_sel.to_excel(writer, sheet_name="MAFE_ratio_selection")
         pd.concat(dms, names=["set", "horizon"]).to_excel(writer, sheet_name="DM_tests")
         forecasts.to_excel(writer, sheet_name="forecasts", index=False)
+        if paths is not None:
+            paths.assign(q=paths["q"].astype(str)).rename(columns={"item_id": "cutoff", "q": "quarter"}).to_excel(
+                writer, sheet_name="assumption_forecasts", index=False)
 
 
 def save_excel_unlocked(path, *tables):
@@ -516,7 +591,7 @@ def main(pipeline=None):
 
     for transform in TRANSFORMS:
         print(f"\nStep 3 - {TARGET_COLUMN}, {unit(transform)}", flush=True)
-        output_dir = os.path.join(OUTPUT_DIR, transform)
+        output_dir = results_dir(transform)
         os.makedirs(output_dir, exist_ok=True)
         exp = Experiment(pipeline, data, transform)
         if exp.rules:
@@ -524,7 +599,8 @@ def main(pipeline=None):
             print("  covariate transformations: " + "; ".join(f"{r}: {cols}" for r, cols in by_rule.items()), flush=True)
         cut = exp.series["DATE"]
         print(f"  cut-offs {quarter_label(cut.iloc[exp.cutoffs[0]])} to {quarter_label(cut.iloc[exp.cutoffs[-1]])}; "
-              f"selection up to {SELECTION_END}, evaluation after; groups: {', '.join(exp.groups)}", flush=True)
+              f"selection up to {SELECTION_END}, evaluation after; groups: {', '.join(exp.groups)}; "
+              f"{MODE_LABELS[ASSUMPTIONS_MODE]}", flush=True)
 
         selected, steps = forward_selection(exp)
         print(f"  Forward selection on the selection period: {set_name(selected)}", flush=True)
@@ -534,9 +610,11 @@ def main(pipeline=None):
               f"ratios to no covariates (< 1: better):")
         print(summary.round(3).to_string(index=False))
 
-        forecasts = pd.concat([res.assign(set=set_name(list(k[0]), k[1])) for k, res in exp.cache.items()])
+        forecasts = pd.concat([res.assign(set=set_name(list(k[0]), None if k[1] == "n/a" else k[1]))
+                               for k, res in exp.cache.items()])
         save_excel_unlocked(os.path.join(output_dir, "covariate_selection.xlsx"),
-                            summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, exp.rules)
+                            summary, definitions, steps, mafe_eval, mafe_sel, dms, forecasts, exp.rules,
+                            exp.assumption_paths)
         plot_ratio_heatmap(mafe_eval, f"Evaluation period (cut-offs after {SELECTION_END})\nMAFE ratio to no "
                                       f"covariates, {unit(transform)}", os.path.join(output_dir, "mafe_ratio_evaluation.png"))
         plot_ratio_heatmap(mafe_sel, f"Selection period (up to {SELECTION_END})\nMAFE ratio to no covariates, "
