@@ -20,7 +20,12 @@
 
 ############### Settings ##################################################################
 
-SETS_TO_PLOT = ["none", "selected", "best"]    # e.g. ["none", "fr_wdr"]
+SETS_TO_PLOT = ["none", "selected", "best"]    # e.g. ["none", "fr_wdr (assumptions past-only)"]
+RUNS_TO_PLOT = None             # None = every run of covariate_selection.py; e.g. ["qoq_cov"]
+# Folder holding the <run>/covariate_selection.xlsx files. None = the folder of the current
+# ASSUMPTIONS_MODE of covariate_selection.py (Outputs/covariate_selection/<mode>). Results
+# made before the assumption modes existed are in "Outputs/covariate_selection".
+RESULTS_FOLDER = None
 HAIR_EVERY = 1                  # 4 = one hair per year, easier to read
 START_YEARS_BEFORE = 2          # observed series shown from this many years before the first cut-off
 
@@ -40,8 +45,12 @@ COVARIATE_COLOR = "#2a6fdb"
 
 #####################  Get the data  ######################################################
 
+def run_dir(run):
+    return os.path.join(RESULTS_FOLDER, run) if RESULTS_FOLDER else cs.results_dir(run)
+
+
 def load_results(run):
-    path = os.path.join(cs.results_dir(run), "covariate_selection.xlsx")
+    path = os.path.join(run_dir(run), "covariate_selection.xlsx")
     if not os.path.exists(path):
         return None, None
     forecasts = pd.read_excel(path, sheet_name="forecasts", parse_dates=["cutoff"])
@@ -146,14 +155,14 @@ def plot_run(run, forecasts, sets, observed, path):
 ################## Main #####################################
 
 def main():
-    for run in cs.TRANSFORMS:
+    for run in RUNS_TO_PLOT or cs.TRANSFORMS:
         forecasts, summary = load_results(run)
         if forecasts is None:
-            print(f"{run}: no results, run covariate_selection.py first")
+            print(f"{run}: no results in {run_dir(run)}, run covariate_selection.py first")
             continue
         print(f"{cs.TARGET_COLUMN}, {cs.unit(run)}", flush=True)
         plot_run(run, forecasts, resolve_sets(summary), observed_series(run),
-                 os.path.join(cs.results_dir(run), "hair_charts_covariates.png"))
+                 os.path.join(run_dir(run), "hair_charts_covariates.png"))
 
 
 if __name__ == "__main__":
