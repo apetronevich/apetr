@@ -252,7 +252,9 @@ def forecast_assumptions(pipeline, full, cutoff_dates, columns):
     )
     pred[["column", "item_id"]] = pred["item_id"].str.split("|", n=1, expand=True)
     pred["q"] = pd.to_datetime(pred["DATE"]).dt.to_period("Q")
-    return pred.pivot_table(index=["item_id", "q"], columns="column", values="predictions").reset_index()
+    # Chronos2 returns float32 forecasts; the covariates' history is float64
+    paths = pred.pivot_table(index=["item_id", "q"], columns="column", values="predictions").reset_index()
+    return paths.astype({c: "float64" for c in paths.columns if c not in ("item_id", "q")})
 
 
 def forecast(pipeline, series, full, past_cols, future_cols, cutoffs, assumption_paths=None):
@@ -277,7 +279,8 @@ def forecast(pipeline, series, full, past_cols, future_cols, cutoffs, assumption
             by_quarter = full.assign(q=full["DATE"].dt.to_period("Q")).drop_duplicates("q").set_index("q")
             for c in future_cols:
                 future_df[c] = future_df["q"].map(by_quarter[c]).to_numpy()
-        future_df = future_df.drop(columns="q")
+        # Chronos2 requires each future covariate to have the same dtype as its history
+        future_df = future_df.drop(columns="q").astype({c: contexts[c].dtype for c in future_cols})
     pred = pipeline.predict_df(
         contexts,
         future_df=future_df,
